@@ -507,9 +507,12 @@ EOF
 ```bash
 cat <<EOF | sudo tee /etc/bluetooth/main.conf >/dev/null
 [General]
+NAME = "${DEVICE_NAME}"
 Class = 0x200414
 DiscoverableTimeout = 0
+AlwaysPairable = true
 PairableTimeout = 0
+JustWorksRepairing = always
 
 [Policy]
 AutoEnable=true
@@ -547,11 +550,26 @@ class Rejected(dbus.DBusException):
     _dbus_error_name = "org.bluez.Error.Rejected"
 
 def set_trusted(path):
+    try:
+        props = dbus.Interface(
+            bus.get_object(BUS_NAME, path),
+            "org.freedesktop.DBus.Properties"
+        )
+        props.Set("org.bluez.Device1", "Trusted", dbus.Boolean(True))
+    except Exception as exc:
+        print(f"set_trusted failed for {path}: {exc}")
+
+def setup_adapter():
     props = dbus.Interface(
-        bus.get_object(BUS_NAME, path),
+        bus.get_object(BUS_NAME, "/org/bluez/hci0"),
         "org.freedesktop.DBus.Properties"
     )
-    props.Set("org.bluez.Device1", "Trusted", dbus.Boolean(True))
+    props.Set("org.bluez.Adapter1", "Powered", dbus.Boolean(True))
+    props.Set("org.bluez.Adapter1", "Alias", dbus.String(DEVICE_NAME))
+    props.Set("org.bluez.Adapter1", "PairableTimeout", dbus.UInt32(0))
+    props.Set("org.bluez.Adapter1", "DiscoverableTimeout", dbus.UInt32(0))
+    props.Set("org.bluez.Adapter1", "Pairable", dbus.Boolean(True))
+    props.Set("org.bluez.Adapter1", "Discoverable", dbus.Boolean(True))
 
 class Agent(dbus.service.Object):
     def __init__(self, bus, path):
@@ -573,13 +591,13 @@ class Agent(dbus.service.Object):
         print(f"RequestPasskey: {device}")
         return dbus.UInt32(0)
 
-    @dbus.service.method(AGENT_INTERFACE, in_signature="ou", out_signature="")
-    def DisplayPasskey(self, device, passkey):
-        print(f"DisplayPasskey: {device} {passkey}")
-
     @dbus.service.method(AGENT_INTERFACE, in_signature="os", out_signature="")
     def DisplayPinCode(self, device, pincode):
         print(f"DisplayPinCode: {device} {pincode}")
+
+    @dbus.service.method(AGENT_INTERFACE, in_signature="ouq", out_signature="")
+    def DisplayPasskey(self, device, passkey, entered):
+        print(f"DisplayPasskey: {device} {passkey} entered={entered}")
 
     @dbus.service.method(AGENT_INTERFACE, in_signature="ou", out_signature="")
     def RequestConfirmation(self, device, passkey):
@@ -603,35 +621,47 @@ class Agent(dbus.service.Object):
     def Cancel(self):
         print("Request canceled")
 
-def setup_adapter():
-    props = dbus.Interface(
-        bus.get_object(BUS_NAME, "/org/bluez/hci0"),
-        "org.freedesktop.DBus.Properties"
+def register_agent():
+    manager = dbus.Interface(
+        bus.get_object(BUS_NAME, "/org/bluez"),
+        "org.bluez.AgentManager1"
     )
-    props.Set("org.bluez.Adapter1", "Powered", dbus.Boolean(True))
-    props.Set("org.bluez.Adapter1", "Alias", dbus.String(DEVICE_NAME))
-    props.Set("org.bluez.Adapter1", "PairableTimeout", dbus.UInt32(0))
-    props.Set("org.bluez.Adapter1", "DiscoverableTimeout", dbus.UInt32(0))
-    props.Set("org.bluez.Adapter1", "Pairable", dbus.Boolean(True))
-    props.Set("org.bluez.Adapter1", "Discoverable", dbus.Boolean(True))
+    try:
+        manager.UnregisterAgent(AGENT_PATH)
+    except Exception:
+        pass
+    setup_adapter()
+    manager.RegisterAgent(AGENT_PATH, "NoInputNoOutput")
+    manager.RequestDefaultAgent(AGENT_PATH)
+    print("AronaDSP Bluetooth agent registered")
+
+def name_owner_changed(name, old_owner, new_owner):
+    if name != BUS_NAME:
+        return
+    if new_owner:
+        print("org.bluez appeared, registering agent")
+        GLib.idle_add(register_agent)
 
 def main():
     global bus
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     bus = dbus.SystemBus()
 
-    agent = Agent(bus, AGENT_PATH)
-
-    manager = dbus.Interface(
-        bus.get_object(BUS_NAME, "/org/bluez"),
-        "org.bluez.AgentManager1"
+    Agent(bus, AGENT_PATH)
+    bus.add_signal_receiver(
+        name_owner_changed,
+        signal_name="NameOwnerChanged",
+        dbus_interface="org.freedesktop.DBus",
+        path="/org/freedesktop/DBus",
+        arg0=BUS_NAME,
     )
 
-    setup_adapter()
-    manager.RegisterAgent(AGENT_PATH, "NoInputNoOutput")
-    manager.RequestDefaultAgent(AGENT_PATH)
+    dbus_service = bus.get_object("org.freedesktop.DBus", "/org/freedesktop/DBus")
+    dbus_dbus = dbus.Interface(dbus_service, "org.freedesktop.DBus")
+    if dbus_dbus.NameHasOwner(BUS_NAME):
+        register_agent()
 
-    print(f"{DEVICE_NAME} Bluetooth agent running")
+    print("AronaDSP Bluetooth agent running")
     GLib.MainLoop().run()
 
 if __name__ == "__main__":
@@ -649,6 +679,7 @@ cat <<EOF | sudo tee /etc/systemd/system/speaker-agent.service >/dev/null
 Description=${DEVICE_NAME} Bluetooth pairing agent
 After=bluetooth.service dbus.service
 Requires=bluetooth.service dbus.service
+PartOf=bluetooth.service
 
 [Service]
 Type=simple
